@@ -89,6 +89,8 @@ import random
 import platform
 import os
 
+from aioping.classes import BoundedTaskGroup
+
 logger = logging.getLogger("aioping")
 default_timer = time.perf_counter
 
@@ -147,18 +149,18 @@ async def receive_one_ping(my_socket, id_, timeout):
     :return:
     """
     loop = asyncio.get_event_loop()
+    # No IP Header when unpriviledged on Linux
+    has_ip_header = (
+            (os.name != "posix")
+            or (platform.system() == "Darwin")
+            or (my_socket.type == socket.SOCK_RAW)
+    )
+    size_d = struct.calcsize("d")  # Pre-calculate size of double
 
     try:
         async with async_timeout.timeout(timeout):
             while True:
                 rec_packet = await loop.sock_recv(my_socket, 1024)
-
-                # No IP Header when unpriviledged on Linux
-                has_ip_header = (
-                    (os.name != "posix")
-                    or (platform.system() == "Darwin")
-                    or (my_socket.type == socket.SOCK_RAW)
-                )
 
                 time_received = default_timer()
 
@@ -168,7 +170,6 @@ async def receive_one_ping(my_socket, id_, timeout):
                     offset = 0
 
                 icmp_header = rec_packet[offset:offset + 8]
-
                 type, code, checksum, packet_id, sequence = struct.unpack(
                     "BBHHH", icmp_header
                 )
@@ -182,9 +183,8 @@ async def receive_one_ping(my_socket, id_, timeout):
                     id_ = int.from_bytes(my_socket.getsockname()[1].to_bytes(2, "big"), "little")
 
                 if packet_id == id_:
-                    data = rec_packet[offset + 8:offset + 8 + struct.calcsize("d")]
+                    data = rec_packet[offset + 8:offset + 8 + size_d]
                     time_sent = struct.unpack("d", data)[0]
-
                     return time_received - time_sent
 
     except asyncio.TimeoutError:
@@ -239,12 +239,14 @@ async def send_one_ping(my_socket, dest_addr, id_, timeout, family):
     )
     packet = header + data
 
-    future = asyncio.get_event_loop().create_future()
+    loop = asyncio.get_event_loop()
+
+    future = loop.create_future()
     callback = functools.partial(sendto_ready, packet=packet, socket=my_socket, dest=dest_addr, future=future)
-    asyncio.get_event_loop().add_writer(my_socket, callback)
+
+    loop.add_writer(my_socket, callback)
 
     await future
-
 
 async def ping(dest_addr, timeout=10, family=None):
     """
@@ -255,7 +257,11 @@ async def ping(dest_addr, timeout=10, family=None):
     """
 
     loop = asyncio.get_event_loop()
-    info = await loop.getaddrinfo(dest_addr, 0)
+
+    try:
+        info = await loop.getaddrinfo(dest_addr, 0)
+    except socket.gaierror:
+        raise socket.gaierror("%s Name or service not known")
 
     logger.debug("%s getaddrinfo result=%s", dest_addr, info)
 
@@ -277,9 +283,10 @@ async def ping(dest_addr, timeout=10, family=None):
     else:
         icmp = proto_icmp6
 
+    my_id = uuid.uuid4().int & 0xFFFF
+
     try:
         my_socket = socket.socket(family, socket.SOCK_RAW, icmp)
-
     except OSError as e:
         if e.errno == 1:
             # Operation not permitted, using SOCK_DGRAM instead:
@@ -290,35 +297,52 @@ async def ping(dest_addr, timeout=10, family=None):
 
     my_socket.setblocking(False)
 
-    my_id = uuid.uuid4().int & 0xFFFF
-
-    await send_one_ping(my_socket, addr, my_id, timeout, family)
-    delay = await receive_one_ping(my_socket, my_id, timeout)
-    my_socket.close()
-
+    try:
+        await send_one_ping(my_socket, addr, my_id, timeout, family)
+        delay = await receive_one_ping(my_socket, my_id, timeout)
+    finally:
+        my_socket.close()
     return delay
 
 
 async def verbose_ping(dest_addr, timeout=2, count=3, family=None):
     """
-    Send >count< ping to >dest_addr< with the given >timeout< and display
-    the result.
+    Send >count< pings to >dest_addr< with the given >timeout< and display
+    the results.
     :param dest_addr:
     :param timeout:
     :param count:
     :param family:
     """
-    for i in range(count):
-        delay = None
-
-        try:
+    try:
+        for i in range(count):
             delay = await ping(dest_addr, timeout, family)
-        except TimeoutError as e:
-            logger.error("%s timed out after %ss" % (dest_addr, timeout))
-        except Exception as e:
-            logger.error("%s failed: %s" % (dest_addr, str(e)))
-            break
+            delay_ms = delay * 1000
+            logger.info("%s received ping in %0.4fms", dest_addr, delay_ms)
+    except TimeoutError:
+        logger.error("%s timed out after %ss", dest_addr, timeout)
+    except Exception as e:
+        logger.error("%s failed: %s", dest_addr, str(e))
 
-        if delay is not None:
-            delay *= 1000
-            logger.info("%s get ping in %0.4fms" % (dest_addr, delay))
+
+async def ping_list(destinations: list[str], timeout: int = 5, max_parallelism: int = 1000) -> list[tuple[str, bool]]:
+    """
+    :param destinations: list of string with destinations to ping
+    :param timeout: maximum timeout per ping to destination (default is 5)
+    :param max_parallelism: how many destinations to concurrently run
+    :return: tuple containing the destination and the boolean value if destination is reachable
+    """
+
+    async def _ping(destination: str, timeout: int) -> tuple[str, bool]:
+        try:
+            result = await ping(destination, timeout=timeout)
+            if result:
+                return destination, True
+        except (socket.gaierror, TimeoutError, OSError):
+            # print("False")
+            return destination, False
+
+    async with BoundedTaskGroup(max_parallelism=max_parallelism) as group:
+        tasks = [group.create_task(_ping(dest, timeout=timeout)) for dest in destinations]
+
+    return [task.result() for task in tasks]
